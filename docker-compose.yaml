@@ -1,0 +1,13 @@
+services:
+  syncer:
+    build: .
+    container_name: rsync-cron
+    env_file: .env
+    volumes:
+      # Map each host path into the container; add as many as configured
+      - "${STORAGE_FROM_1}:/mnt/from1:ro"
+      - "${STORAGE_TO_1}:/mnt/to1"
+      # Add more mounts as needed:
+      # - "${STORAGE_FROM_2}:/mnt/from2:ro"
+      # - "${STORAGE_TO_2}:/mnt/to2"
+    restart: unless-stopped
