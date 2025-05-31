@@ -1,7 +1,7 @@
 FROM alpine:latest
 
 # Install dependencies
-RUN apk add --no-cache bash rsync curl tzdata python3 py3-pip
+RUN apk add --no-cache bash rsync curl tzdata python3 py3-pip jq coreutils
 
 # Set up a virtual environment and install croniter
 RUN python3 -m venv /venv && \
