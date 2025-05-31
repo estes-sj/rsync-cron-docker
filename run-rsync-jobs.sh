@@ -3,10 +3,33 @@ set -euo pipefail
 
 REPORT_URL="${BACKREST_REPORTER_URL:-}"
 
-# helper: write to stdout
-log() {
+ping_healthcheck() {
+  local suffix="$1"
+  local msg="$2"
+
+  if [[ -n "${HEALTHCHECK_PING_URL:-}" ]]; then
+    curl -fsS -X POST "${HEALTHCHECK_PING_URL}${suffix}" \
+      -H 'Content-Type: text/plain' \
+      --data "$msg" || echo "Healthcheck ping to ${suffix:-/} failed" >> /proc/1/fd/1
+  fi
+}
+
+start() {
   local msg="$1"
-  echo "$msg" >> /proc/1/fd/1 # → container stdout (docker logs)
+  echo "$msg" >> /proc/1/fd/1
+  ping_healthcheck "/start" "$msg"
+}
+
+ok() {
+  local msg="$1"
+  echo "$msg" >> /proc/1/fd/1
+  ping_healthcheck "" "$msg"
+}
+
+fail() {
+  local msg="$1"
+  echo "$msg" >> /proc/1/fd/1
+  ping_healthcheck "/fail" "$msg"
 }
 
 # Iterate over configured pairs

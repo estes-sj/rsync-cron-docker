@@ -28,7 +28,14 @@ if expr:
     print(next_run.strftime("%Y-%m-%d %H:%M:%S %Z"))
 PYCODE
 )
-echo "[$TS] rsync-cron container started. Next scheduled run at: ${NEXT}" | tee -a "$LOGFILE"
+msg="[$TS] rsync-cron container started. Next scheduled run at: ${NEXT}"
+echo "$msg" | tee -a "$LOGFILE"
+
+if [[ -n "${HEALTHCHECK_PING_URL:-}" ]]; then
+  curl -fsS -X POST "${HEALTHCHECK_PING_URL}" \
+    -H 'Content-Type: text/plain' \
+    --data "$msg" || echo "Failed to notify healthcheck OK" >> /proc/1/fd/1
+fi
 
 # Start cron daemon
 exec crond -f -l 2
