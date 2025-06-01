@@ -1,5 +1,13 @@
 FROM alpine:latest
 
+# Labels
+LABEL org.opencontainers.image.title="rsync-cron" \
+      org.opencontainers.image.description="Cron-based rsync runner with multi-source support, health checks, and optional event reporting." \
+      org.opencontainers.image.url="https://hub.docker.com/r/estessj/rsync-cron" \
+      org.opencontainers.image.source="https://github.com/estes-sj/rsync-cron-docker" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.authors="Samuel Estes <samuel.estes2000@gmail.com>"
+
 # Install dependencies
 RUN apk add --no-cache bash rsync curl tzdata python3 py3-pip jq coreutils
 

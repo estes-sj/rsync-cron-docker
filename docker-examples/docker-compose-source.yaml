@@ -1,6 +1,6 @@
 services:
   rsync-cron:
-    image: estessj/rsync-cron:latest
+    build: .
     container_name: rsync-cron
     env_file: .env
     volumes:
