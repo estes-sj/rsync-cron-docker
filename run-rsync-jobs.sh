@@ -98,8 +98,8 @@ for i in $(compgen -A variable \
 
   # Prepare fields for JSON
   # ──────────────────────────────────────────────────────────────────────────────
-  # 1) Generate a snapshot ID (SHA-256 of the current timestamp)
-  snapshot_id=$(date +%s%N | sha256sum | cut -c1-64)
+  # 1) Generate a snapshot ID (SHA-256 of the sources, destination, and current timestamp)
+  snapshot_id=$(echo "${SRC}_${DST}_$(date +%s%N)" | sha256sum | cut -c1-64)
 
   # 2) Record start time (seconds since epoch w/ nanoseconds) & a pretty timestamp
   start_ns=$(date +"%s%N")
@@ -113,9 +113,9 @@ for i in $(compgen -A variable \
   # 4) Record finish time and compute duration
   finish_ns=$(date +"%s%N")
   TIMESTAMP_END=$(date +"%Y-%m-%dT%H:%M:%S%z")
-  # Subtract in bash (integer math):
+  # Subtract to get the elapsed time in ns
   diff_ns=$(( finish_ns - start_ns )) # e.g. 212112 ns
-  # Convert to seconds + fractional part:
+  # Convert to seconds + fractional part
   duration_sec=$(awk "BEGIN { printf \"%.6f\", $diff_ns / 1000000000 }")
 
   # 5) Compute folder stats from the source mount
@@ -134,14 +134,68 @@ for i in $(compgen -A variable \
     total_dirs=""
   fi
 
-  # 6) Log success or failure
-  if [[ $EXIT_CODE -eq 0 ]]; then
-    ok "Completed rsync: '$SRC' → '$DST' (exit code $EXIT_CODE, duration ${duration_sec}s, bytes_transferred=${total_bytes:-0}, files_processed=${total_files:-0})"
+  # 6) Parse the --stats from the rsync output
+  # (a) Number of created files
+  created_files=$(awk -F: '/^Number of created files:/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$rsync_output")
+  # (b) Number of deleted files
+  deleted_files=$(awk -F: '/^Number of deleted files:/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$rsync_output")
+  # (c) Number of regular files transferred
+  regular_transferred=$(awk -F: '/^Number of regular files transferred:/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$rsync_output")
+  # (d) Total transferred file size (as raw, e.g. "13.17K")
+  total_transferred_size=$(awk -F: '/^Total transferred file size:/ { gsub(/^[[:space:]]*/,"", $2); print $2 }' <<<"$rsync_output")
+
+  # If any of these didn’t match, force them to "0" or empty
+  created_files=${created_files:-0}
+  deleted_files=${deleted_files:-0}
+  regular_transferred=${regular_transferred:-0}
+  total_transferred_size=${total_transferred_size:-"0"}
+
+  # Extract "13.17K" (strip off the trailing " bytes")
+  total_transferred_size_human=$(awk -F: '/^Total transferred file size:/ {
+    sub(/ bytes$/, "", $2)
+    gsub(/^[[:space:]]+/, "", $2)
+    print $2
+  }' <<<"$rsync_output")
+
+  # Convert to a raw‐byte integer (e.g. 13500)
+  if [[ -n "$total_transferred_size_human" ]]; then
+    total_transferred_size_bytes=$(
+      numfmt --from=iec "$total_transferred_size_human" 2>/dev/null || echo ""
+    )
   else
-    fail "rsync FAILED: '$SRC' → '$DST' (exit code $EXIT_CODE, duration ${duration_sec}s, bytes_transferred=${total_bytes:-0}, files_processed=${total_files:-0})"
+    total_transferred_size_bytes=""
   fi
 
-  # 7) Build & POST JSON if REPORT_URL is set
+  # Default to empty or null if conversion failed
+  total_transferred_size_bytes=${total_transferred_size_bytes:-""}
+
+  # Compute files_changed if the associated stats are valid
+  if [[ -n "$deleted_files" && -n "$regular_transferred" ]]; then
+    files_changed=$(( deleted_files + regular_transferred ))
+  else
+    files_changed=""
+  fi
+
+  # Compute files_unmodified if the associated stats are valid
+  if [[ -n "$total_files" && -n "$created_files" && -n "$regular_transferred" ]]; then
+    files_unmodified=$(( total_files - created_files - regular_transferred ))
+    # guard against negative (in case rsync stats were inconsistent)
+    if (( files_unmodified < 0 )); then
+      files_unmodified=0
+    fi
+  else
+    files_unmodified=""
+  fi
+
+  # 7) Log success or failure for the rsync process.
+  #    The logged duration only includes the rsync length while the healthchecks time (since the /start) includes gathering stats
+  if [[ $EXIT_CODE -eq 0 ]]; then
+    ok "Completed rsync: '$SRC' → '$DST' (exit code $EXIT_CODE, duration ${duration_sec}s, data_transferred=${total_transferred_size}, files_processed=${total_files:-0})"
+  else
+    fail "rsync FAILED: '$SRC' → '$DST' (exit code $EXIT_CODE, duration ${duration_sec}s, data_transferred=${total_transferred_size}, files_processed=${total_files:-0})"
+  fi
+
+  # 8) Backrest reporter - Build & POST JSON if REPORT_URL is set
   if [[ -n "$REPORT_URL" ]]; then
     if [[ -z "$BACKREST_API_KEY" ]]; then
       fail "BACKREST_REPORT_URL is set but BACKREST_API_KEY is not set."
@@ -180,40 +234,77 @@ for i in $(compgen -A variable \
     # Build jq arguments to handle numeric vs null correctly
     # (jq will treat an empty string as a literal "" if we don’t convert it to null)
     #
-    #   - repo                  = REPO_ARG_VALUE (which is STORAGE_REPO_N or STORAGE_TO_N)
-    #   - plan                  = PLAN_ARG_VALUE (which is STORAGE_PLAN_N or STORAGE_FROM_N)
-    #   - files_unmodified      = total_files    (if not empty) else null
-    #   - dirs_unmodified       = total_dirs     (if not empty) else null
-    #   - total_files_processed = total_files    (number of files in repo)
-    #   - total_bytes_processed = total_bytes    (total bytes in repo)
-    #   - total_duration        = duration       (rsync command)
+    #      - repo                  = REPO_ARG_VALUE
+    #      - plan                  = PLAN_ARG_VALUE
+    #      - files_new             = created_files
+    #      - files_changed         = files_changed (deleted_files + regular_transferred)
+    #      - files_unmodified      = files_unmodified (total_files - created_files - regular_transferred)
+    #      - dirs_unmodified       = total_dirs
+    #      - total_files_processed = total_files
+    #      - total_bytes_processed = total_bytes
+    #      - total_duration        = duration_sec
+    #      - data_added            = total_transferred_size_bytes
     #
-    jq_repo_arg=(--arg repo "$REPO_ARG_VALUE")
-    jq_plan_arg=(--arg plan "$PLAN_ARG_VALUE")
+    
+    # Summary field repo
+    jq_repo_arg=( --arg repo "$REPO_ARG_VALUE" )
 
+    # Summary field plan
+    jq_plan_arg=( --arg plan "$PLAN_ARG_VALUE" )
+
+    # Summary field total_files_processed
     if [[ -n "$total_files" ]]; then
-      jq_files_arg=(--argjson files_val "$total_files")
+      jq_files_arg=( --argjson files_val "$total_files" )
     else
-      jq_files_arg=(--argjson files_val null)
+      jq_files_arg=( --argjson files_val null )
     fi
 
     if [[ -n "$total_dirs" ]]; then
-      jq_dirs_arg=(--argjson dirs_val "$total_dirs")
+      jq_dirs_arg=( --argjson dirs_val "$total_dirs" )
     else
-      jq_dirs_arg=(--argjson dirs_val null)
+      jq_dirs_arg=( --argjson dirs_val null )
     fi
 
+    # Summary field total_bytes_processed
     if [[ -n "$total_bytes" ]]; then
-      jq_bytes_arg=(--argjson bytes_val "$total_bytes")
+      jq_bytes_arg=( --argjson bytes_val "$total_bytes" )
     else
-      jq_bytes_arg=(--argjson bytes_val null)
+      jq_bytes_arg=( --argjson bytes_val null )
     fi
 
+    # Summary field total_duration
     if [[ -n "$duration_sec" ]]; then
-      # Convert bash string to jq float
-      jq_duration_arg=(--argjson dur_val "$duration_sec")
+      jq_duration_arg=( --argjson dur_val "$duration_sec" )
     else
-      jq_duration_arg=(--argjson dur_val null)
+      jq_duration_arg=( --argjson dur_val null )
+    fi
+
+    # Summary field - files_new
+    if [[ -n "$created_files" ]]; then
+      jq_new_arg=( --argjson files_new "$created_files" )
+    else
+      jq_new_arg=( --argjson files_new null )
+    fi
+
+    # Summary field - files_changed
+    if [[ -n "$files_changed" ]]; then
+      jq_changed_arg=( --argjson files_changed "$files_changed" )
+    else
+      jq_changed_arg=( --argjson files_changed null )
+    fi
+
+    # Summary field - files_unmodified
+    if [[ -n "$files_unmodified" ]]; then
+      jq_unmod_files_arg=( --argjson files_unmodified "$files_unmodified" )
+    else
+      jq_unmod_files_arg=( --argjson files_unmodified null )
+    fi
+
+    # Summary field - data_added
+    if [[ -n "$total_transferred_size_bytes" ]]; then
+      jq_data_added_arg=( --argjson data_added "$total_transferred_size_bytes" )
+    else
+      jq_data_added_arg=( --argjson data_added null )
     fi
 
     # Build the JSON payload exactly as requested
@@ -226,8 +317,12 @@ for i in $(compgen -A variable \
         "${jq_plan_arg[@]}" \
         --arg snapshot "$snapshot_id" \
         --arg error    "$ERROR_FIELD" \
-        "${jq_files_arg[@]}" \
+        "${jq_new_arg[@]}" \
+        "${jq_changed_arg[@]}" \
+        "${jq_unmod_files_arg[@]}" \
         "${jq_dirs_arg[@]}" \
+        "${jq_data_added_arg[@]}" \
+        "${jq_files_arg[@]}" \
         "${jq_bytes_arg[@]}" \
         "${jq_duration_arg[@]}" \
         '
@@ -241,20 +336,20 @@ for i in $(compgen -A variable \
           snapshot_stats: {
             message_type:     "summary",
             error:            (if $error == "" then null else ($error | gsub("^\"|\"$"; "")) end),
-            during:           "",                      # left empty per example
+            during:           "",                     # left empty per example
             item:             "",
-            files_new:        0,
-            files_changed:    0,
-            files_unmodified: ($files_val),
+            files_new:        ($files_new),           # CREATED files
+            files_changed:    ($files_changed),       # DELETED + TRANSFERRED
+            files_unmodified: ($files_unmodified),    # total_files - created - transferred
             dirs_new:         0,
             dirs_changed:     0,
-            dirs_unmodified:  ($dirs_val),
+            dirs_unmodified:  ($dirs_val),            # total_dirs
             data_blobs:       0,
             tree_blobs:       0,
-            data_added:       0,
-            total_files_processed: ($files_val),
-            total_bytes_processed: ($bytes_val),
-            total_duration:        ($dur_val),
+            data_added:       ($data_added),          # bytes actually sent by rsync
+            total_files_processed: ($files_val),      # total_files
+            total_bytes_processed: ($bytes_val),      # total_bytes
+            total_duration:        ($dur_val),        # duration_sec
             snapshot_id:     $snapshot,
             percent_done:    0,
             total_files:     0,
@@ -267,7 +362,7 @@ for i in $(compgen -A variable \
         '
     )
     
-    log_info "Posting JSON report to $REPORT_URL: $payload"
+    log_info "Posting JSON report to $REPORT_URL"
     if ! curl -fsS -X POST "$REPORT_URL" \
          -H 'Content-Type: application/json' \
          -H "X-API-Key: $BACKREST_API_KEY" \
